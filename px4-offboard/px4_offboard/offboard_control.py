@@ -55,7 +55,7 @@ class LinearPrecisionLanding(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Timer for control loop
-        self.dt = 0.05  # 20Hz
+        self.dt = 0.02  # seconds
         self.timer = self.create_timer(self.dt, self.control_loop_callback)
         
         # Parameters
