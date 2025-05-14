@@ -130,15 +130,13 @@ class LinearPrecisionLanding(Node):
         self.publish_offboard_control_mode()
 
         # Always command camera down when offboard engaged & armed
-        if (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD and
-            self.arming_state == VehicleStatus.ARMING_STATE_ARMED):
+        if (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD):
             cmd = String()
             cmd.data = 'straight_down'
             self.camera_cmd_pub.publish(cmd)
 
         # Only proceed with landing when offboard engaged & armed
-        if not (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD and
-                self.arming_state == VehicleStatus.ARMING_STATE_ARMED):
+        if not (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD):
             return
 
         # AprilTag detection
