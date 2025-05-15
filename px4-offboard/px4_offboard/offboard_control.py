@@ -16,6 +16,8 @@ import tf2_ros
 import math
 import time
 from std_msgs.msg import String  # For camera commands
+from std_msgs.msg import Float32MultiArray  # For tag position
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue  # For node status
 
 class LinearPrecisionLanding(Node):
     def __init__(self):
@@ -34,10 +36,14 @@ class LinearPrecisionLanding(Node):
             OffboardControlMode,
             '/fmu/in/offboard_control_mode',
             qos_profile)
+        
+
         self.publisher_trajectory = self.create_publisher(
             TrajectorySetpoint,
             '/fmu/in/trajectory_setpoint',
             qos_profile)
+        
+
         self.status_sub = self.create_subscription(
             VehicleStatus,
             '/fmu/out/vehicle_status_v1',
@@ -50,6 +56,18 @@ class LinearPrecisionLanding(Node):
             '/siyi_a8/command',
             10)
         
+        # Status publisher
+        self.status_pub = self.create_publisher(
+            DiagnosticArray,
+            '/linear_precision_landing/status',
+            10)
+        
+        # Tag position publisher (for visualization/debugging)
+        self.tag_pos_pub = self.create_publisher(
+            Float32MultiArray,
+            '/linear_precision_landing/tag_position',
+            10)
+        
         # TF listener for AprilTag pose
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -57,6 +75,9 @@ class LinearPrecisionLanding(Node):
         # Timer for control loop
         self.dt = 0.02  # seconds
         self.timer = self.create_timer(self.dt, self.control_loop_callback)
+        
+        # Timer for status publishing (1Hz)
+        self.status_timer = self.create_timer(1.0, self.publish_status)
         
         # Parameters
         self.declare_parameter('tag_frame', 'marker')
@@ -103,12 +124,26 @@ class LinearPrecisionLanding(Node):
         self.DESCENDING = 2
         self.LANDED = 3
         self.landing_state = self.SEARCHING
+        self.landing_state_names = {
+            self.SEARCHING: "SEARCHING",
+            self.CENTERING: "CENTERING",
+            self.DESCENDING: "DESCENDING",
+            self.LANDED: "LANDED"
+        }
+        
+        # Current position tracking
+        self.current_position = np.array([self.search_x, self.search_y, -self.search_altitude])
         
         # Search pattern
         self.search_start_time = time.time()
         self.search_angle = 0.0
         
-        self.get_logger().info('Linear precision landing node initialized')
+        # Status tracking
+        self.detection_count = 0
+        self.status_message = "Initialized"
+        self.last_state_change_time = time.time()
+        
+        self.get_logger().info('Precision landing node initialized')
 
     def vehicle_status_callback(self, msg):
         self.nav_state = msg.nav_state
@@ -139,6 +174,9 @@ class LinearPrecisionLanding(Node):
         if not (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD):
             return
 
+        # Record previous state for change detection
+        prev_state = self.landing_state
+
         # AprilTag detection
         transform = self.get_tag_transform()
         if transform:
@@ -149,21 +187,36 @@ class LinearPrecisionLanding(Node):
                 transform.transform.translation.y,
                 transform.transform.translation.z
             ])
+            
+            # Publish tag position for visualization/debugging
+            tag_pos_msg = Float32MultiArray()
+            tag_pos_msg.data = self.tag_position.tolist()
+            self.tag_pos_pub.publish(tag_pos_msg)
+            
             if self.consecutive_detections >= self.detections_needed:
                 if not self.tag_detected:
                     self.get_logger().info('Tag confidently detected')
+                    self.status_message = "Tag detected"
                 self.tag_detected = True
+                self.detection_count += 1
                 if self.landing_state == self.SEARCHING:
                     self.landing_state = self.CENTERING
+                    self.status_message = "Transitioning to CENTERING"
                     self.get_logger().info('Transitioning to CENTERING')
         else:
             if self.tag_detected and self.last_detection_time and \
                (time.time() - self.last_detection_time > self.detection_timeout):
                 self.tag_detected = False
+                self.status_message = "Tag lost"
                 if self.landing_state in [self.CENTERING, self.DESCENDING]:
                     self.landing_state = self.SEARCHING
+                    self.status_message = "Returning to SEARCHING - tag lost"
                     self.get_logger().info('Returning to SEARCHING')
             self.consecutive_detections = 0
+
+        # Track state changes
+        if prev_state != self.landing_state:
+            self.last_state_change_time = time.time()
 
         # Execute state actions
         if self.landing_state == self.SEARCHING:
@@ -193,9 +246,11 @@ class LinearPrecisionLanding(Node):
             x = self.search_x + radius * math.cos(self.search_angle)
             y = self.search_y + radius * math.sin(self.search_angle)
             msg.position[0], msg.position[1], msg.position[2] = x, y, -self.search_altitude
+            self.current_position = np.array([x, y, -self.search_altitude])
         else:
             msg.position[0], msg.position[1], msg.position[2] = \
                 self.search_x, self.search_y, -self.search_altitude
+            self.current_position = np.array([self.search_x, self.search_y, -self.search_altitude])
         self.publisher_trajectory.publish(msg)
 
     def execute_centering(self):
@@ -210,6 +265,7 @@ class LinearPrecisionLanding(Node):
         error = np.linalg.norm(self.current_position[:2] - self.tag_position[:2])
         if error < self.xy_tolerance:
             self.landing_state = self.DESCENDING
+            self.status_message = "Centered above tag, descending"
             self.get_logger().info('Centered above tag, descending')
         self.publisher_trajectory.publish(msg)
 
@@ -225,6 +281,7 @@ class LinearPrecisionLanding(Node):
         self.current_position = np.array([tx, ty, -new_alt])
         if new_alt <= 0.05:
             self.landing_state = self.LANDED
+            self.status_message = "Landing complete"
             self.get_logger().info('Landing complete')
         self.publisher_trajectory.publish(msg)
 
@@ -238,6 +295,53 @@ class LinearPrecisionLanding(Node):
         msg.position[0], msg.position[1], msg.position[2] = tx, ty, 0.0
         self.publisher_trajectory.publish(msg)
 
+    def publish_status(self):
+        """Publish detailed node status at regular intervals"""
+        diag_array = DiagnosticArray()
+        diag_array.header.stamp = self.get_clock().now().to_msg()
+        
+        # Create status message
+        status = DiagnosticStatus()
+        status.name = "linear_precision_landing"
+        
+        # Set overall status level
+        if not (self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD):
+            status.level = DiagnosticStatus.WARN
+            status.message = "Not in OFFBOARD mode"
+        elif not self.tag_detected and self.landing_state != self.SEARCHING:
+            status.level = DiagnosticStatus.WARN
+            status.message = "Tag not detected"
+        else:
+            status.level = DiagnosticStatus.OK
+            status.message = self.status_message
+        
+        # Add detailed values
+        status.values = [
+            KeyValue(key="landing_state", value=self.landing_state_names[self.landing_state]),
+            KeyValue(key="nav_state", value=str(self.nav_state)),
+            KeyValue(key="arming_state", value=str(self.arming_state)),
+            KeyValue(key="tag_detected", value=str(self.tag_detected)),
+            KeyValue(key="consecutive_detections", value=str(self.consecutive_detections)),
+            KeyValue(key="total_detections", value=str(self.detection_count)),
+            KeyValue(key="current_position_x", value=f"{self.current_position[0]:.2f}"),
+            KeyValue(key="current_position_y", value=f"{self.current_position[1]:.2f}"),
+            KeyValue(key="current_position_z", value=f"{self.current_position[2]:.2f}"),
+            KeyValue(key="current_altitude", value=f"{-self.current_position[2]:.2f}"),
+            KeyValue(key="time_in_current_state", value=f"{time.time() - self.last_state_change_time:.1f}"),
+        ]
+        
+        # Add tag position if detected
+        if self.tag_detected:
+            status.values.extend([
+                KeyValue(key="tag_position_x", value=f"{self.tag_position[0]:.2f}"),
+                KeyValue(key="tag_position_y", value=f"{self.tag_position[1]:.2f}"),
+                KeyValue(key="tag_position_z", value=f"{self.tag_position[2]:.2f}"),
+                KeyValue(key="xy_error", value=f"{np.linalg.norm(self.current_position[:2] - self.tag_position[:2]):.3f}"),
+            ])
+        
+        diag_array.status = [status]
+        self.status_pub.publish(diag_array)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -245,4 +349,3 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
